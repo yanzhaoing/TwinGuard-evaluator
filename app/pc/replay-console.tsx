@@ -110,6 +110,37 @@ function nearestFrame(frames: ReplayFrame[], time: number) {
   return frames[low];
 }
 
+function interpolatedPoseFrame(frames: ReplayFrame[], time: number) {
+  const fallback = nearestFrame(frames, time);
+  if (!fallback || frames.length < 2) return fallback;
+
+  let rightIndex = 0;
+  while (rightIndex < frames.length && frames[rightIndex].t < time) rightIndex += 1;
+  if (rightIndex === 0 || rightIndex >= frames.length) return fallback;
+
+  const left = frames[rightIndex - 1];
+  const right = frames[rightIndex];
+  const gap = right.t - left.t;
+  if (
+    gap <= 0 || gap > 0.25
+    || !left.person || !right.person
+    || !left.bbox || !right.bbox
+    || left.pose.length === 0 || left.pose.length !== right.pose.length
+  ) return fallback;
+
+  const ratio = clamp((time - left.t) / gap, 0, 1);
+  const mix = (from: number, to: number) => from + (to - from) * ratio;
+  return {
+    ...fallback,
+    bbox: left.bbox.map((value, index) => mix(value, right.bbox![index])) as ReplayFrame['bbox'],
+    pose: left.pose.map((point, index) => [
+      mix(point[0], right.pose[index][0]),
+      mix(point[1], right.pose[index][1]),
+      mix(point[2], right.pose[index][2]),
+    ] as PosePoint),
+  };
+}
+
 function previewStart(replayCase: ReplayCase) {
   const anchor = replayCase.kind === 'fall'
     ? Math.max(0, (replayCase.instabilityStart ?? replayCase.firstWarning ?? 0) - 1.2)
@@ -148,12 +179,29 @@ export default function ReplayConsole() {
     () => activeCase ? nearestFrame(activeCase.frames, currentTime) : null,
     [activeCase, currentTime],
   );
+  const poseFrame = useMemo(
+    () => activeCase ? interpolatedPoseFrame(activeCase.frames, currentTime) : null,
+    [activeCase, currentTime],
+  );
 
   useEffect(() => {
     if (!playing) return;
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (typeof video.requestVideoFrameCallback === 'function') {
+      let callbackId = 0;
+      const update: VideoFrameRequestCallback = (_now, metadata) => {
+        setCurrentTime(metadata.mediaTime);
+        if (!video.paused && !video.ended) callbackId = video.requestVideoFrameCallback(update);
+      };
+      callbackId = video.requestVideoFrameCallback(update);
+      return () => video.cancelVideoFrameCallback(callbackId);
+    }
+
     let raf = 0;
     const update = () => {
-      if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
+      setCurrentTime(video.currentTime);
       raf = requestAnimationFrame(update);
     };
     raf = requestAnimationFrame(update);
@@ -176,7 +224,7 @@ export default function ReplayConsole() {
   }, [speed]);
 
   if (error) return <div className="replay-error" role="alert">{error}</div>;
-  if (!payload || !activeCase || !frame) return <div className="replay-loading"><i /><span>正在校验并载入回放结果</span></div>;
+  if (!payload || !activeCase || !frame || !poseFrame) return <div className="replay-loading"><i /><span>正在校验并载入回放结果</span></div>;
 
   const risk = frame.riskScore ?? 0;
   const rapid = (frame.rapidScore ?? 0) * 100;
@@ -250,26 +298,42 @@ export default function ReplayConsole() {
               onPlay={() => setPlaying(true)}
               onPause={() => setPlaying(false)}
               onEnded={() => setPlaying(false)}
-              onSeeked={(event) => setCurrentTime(event.currentTarget.currentTime)}
+              onLoadedData={(event) => {
+                const video = event.currentTarget;
+                if (typeof video.requestVideoFrameCallback === 'function') {
+                  video.requestVideoFrameCallback((_now, metadata) => setCurrentTime(metadata.mediaTime));
+                } else setCurrentTime(video.currentTime);
+              }}
+              onSeeked={(event) => {
+                const video = event.currentTarget;
+                if (typeof video.requestVideoFrameCallback === 'function') {
+                  video.requestVideoFrameCallback((_now, metadata) => setCurrentTime(metadata.mediaTime));
+                } else setCurrentTime(video.currentTime);
+              }}
+              onTimeUpdate={(event) => {
+                if (typeof event.currentTarget.requestVideoFrameCallback !== 'function') {
+                  setCurrentTime(event.currentTarget.currentTime);
+                }
+              }}
               aria-label={`${activeCase.title}原始视频`}
             />
             <svg className="pose-layer" viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true">
-              {frame.bbox && (
+              {poseFrame.bbox && (
                 <rect
-                  x={frame.bbox[0] / activeCase.width}
-                  y={frame.bbox[1] / activeCase.height}
-                  width={(frame.bbox[2] - frame.bbox[0]) / activeCase.width}
-                  height={(frame.bbox[3] - frame.bbox[1]) / activeCase.height}
+                  x={poseFrame.bbox[0] / activeCase.width}
+                  y={poseFrame.bbox[1] / activeCase.height}
+                  width={(poseFrame.bbox[2] - poseFrame.bbox[0]) / activeCase.width}
+                  height={(poseFrame.bbox[3] - poseFrame.bbox[1]) / activeCase.height}
                   className="pose-box"
                 />
               )}
               {skeleton.map(([from, to]) => {
-                const a = frame.pose[from];
-                const b = frame.pose[to];
+                const a = poseFrame.pose[from];
+                const b = poseFrame.pose[to];
                 if (!a || !b || a[2] < .28 || b[2] < .28) return null;
                 return <line key={`${from}-${to}`} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} className="pose-bone" />;
               })}
-              {frame.pose.map((point, index) => point[2] >= .28
+              {poseFrame.pose.map((point, index) => point[2] >= .28
                 ? <circle key={index} cx={point[0]} cy={point[1]} r="0.006" className="pose-joint" />
                 : null)}
             </svg>
