@@ -17,7 +17,7 @@ export default function GuardianPage() {
       <a className="skip-link" href="#guardian-main">跳到主要内容</a>
       <header className="mobile-header guardian-header">
         <Link href="/" aria-label="返回 TwinGuard 首页">TwinGuard</Link>
-        <span>家属端</span>
+        <span>家属通知端</span>
       </header>
 
       <div id="guardian-main" className="guardian-shell">
@@ -26,36 +26,36 @@ export default function GuardianPage() {
         <section className="person-status" aria-labelledby="guardian-title">
           <div className="avatar" aria-hidden="true">家</div>
           <div>
-            <p>居家守护</p>
-            <h1 id="guardian-title">31分钟居家实测</h1>
-            <span><i aria-hidden="true" /> 2026年8月27日 · 连续31分03秒</span>
+            <p>家属通知端</p>
+            <h1 id="guardian-title">老人居家守护</h1>
+            <span><i aria-hidden="true" /> 设备在线 · 守护中</span>
           </div>
         </section>
 
         <section className="guardian-card" aria-labelledby="care-title">
           <div className="card-row">
             <div>
-              <p>实测结果</p>
-              <h2 id="care-title">日常活动，未见跌倒</h2>
+              <p>当前状态</p>
+              <h2 id="care-title">老人当前安全</h2>
             </div>
-            <span className="plain-status success">已结束</span>
+            <span className="plain-status success">正常</span>
           </div>
           <dl className="guardian-facts">
-            <div><dt>视频抽样</dt><dd>42个时点</dd></div>
-            <div><dt>人工标注</dt><dd>38个有人，4个无人</dd></div>
-            <div><dt>原系统误确认</dt><dd>1次，已定位</dd></div>
+            <div><dt>视频设备</dt><dd>在线</dd></div>
+            <div><dt>守护状态</dt><dd>持续监测</dd></div>
+            <div><dt>待处理通知</dt><dd>1条体验事件</dd></div>
           </dl>
         </section>
 
         <section className="guardian-card" aria-labelledby="notice-title">
           <div className="card-row">
             <div>
-              <p>家属通知</p>
-              <h2 id="notice-title">微信联调消息已收到</h2>
+              <p>体验通知</p>
+              <h2 id="notice-title">检测到疑似跌倒风险</h2>
             </div>
-            <span className="plain-status success">送达</span>
+            <span className="plain-status success">待确认</span>
           </div>
-          <p className="guardian-copy">微信通知已送达（独立联调）。31分钟实测未发生跌倒，因此没有触发真实告警。确认高风险后，系统会保存发生时间、风险原因和对应录像。</p>
+          <p className="guardian-copy">系统发现快速下降和倒地姿态，已生成风险记录。请联系老人确认情况，并在下方记录处置结果。</p>
 
           {careState === 'pending' ? (
             <div className="guardian-actions" aria-label="处置操作">
@@ -71,7 +71,7 @@ export default function GuardianPage() {
           )}
         </section>
 
-        <Link className="guardian-link" href="/pc">查看31分钟实测摘要 →</Link>
+        <Link className="guardian-link" href="/pc">查看线上守护 →</Link>
       </div>
     </main>
   );

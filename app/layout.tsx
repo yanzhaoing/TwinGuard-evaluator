@@ -3,7 +3,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: 'TwinGuard｜居家跌倒风险守护',
-  description: '基于萤石视频流的居家跌倒风险分析，以及一次31分钟真实居家实测记录。',
+  description: '面向老人、家属与守护人员的居家跌倒风险守护产品体验。',
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
