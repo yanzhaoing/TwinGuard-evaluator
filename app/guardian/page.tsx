@@ -1,6 +1,6 @@
 'use client';
 
-import Link from 'next/link';
+
 import { useState } from 'react';
 
 type CareState = 'pending' | 'safe' | 'follow';
@@ -9,14 +9,14 @@ export default function GuardianPage() {
   const [careState, setCareState] = useState<CareState>('pending');
 
   function explainCall() {
-    window.alert('体验模式：未拨打电话。');
+    window.alert('试用模式：不会拨打电话。');
   }
 
   return (
     <main className="guardian-page">
       <a className="skip-link" href="#guardian-main">跳到主要内容</a>
       <header className="mobile-header guardian-header">
-        <Link href="/" aria-label="返回 TwinGuard 首页">TwinGuard</Link>
+        <a href="/" aria-label="返回 TwinGuard 首页">TwinGuard</a>
         <span>家属通知端</span>
       </header>
 
@@ -42,15 +42,15 @@ export default function GuardianPage() {
           </div>
           <dl className="guardian-facts">
             <div><dt>视频设备</dt><dd>在线</dd></div>
-            <div><dt>守护状态</dt><dd>持续监测</dd></div>
-            <div><dt>待处理通知</dt><dd>1条体验事件</dd></div>
+            <div><dt>守护状态</dt><dd>守护中</dd></div>
+            <div><dt>待处理通知</dt><dd>1 条新通知</dd></div>
           </dl>
         </section>
 
         <section className="guardian-card" aria-labelledby="notice-title">
           <div className="card-row">
             <div>
-              <p>体验通知</p>
+              <p>最新通知</p>
               <h2 id="notice-title">检测到疑似跌倒风险</h2>
             </div>
             <span className="plain-status success">待确认</span>
@@ -71,7 +71,7 @@ export default function GuardianPage() {
           )}
         </section>
 
-        <Link className="guardian-link" href="/pc">查看线上守护 →</Link>
+        <a className="guardian-link" href="/pc/">查看线上守护 →</a>
       </div>
     </main>
   );

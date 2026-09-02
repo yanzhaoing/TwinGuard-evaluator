@@ -1,6 +1,6 @@
 'use client';
 
-import Link from 'next/link';
+
 import { useEffect, useRef, useState } from 'react';
 
 type HelpState = 'idle' | 'countdown' | 'sent' | 'safe';
@@ -41,14 +41,14 @@ export default function ElderPage() {
   }
 
   function explainCall() {
-    window.alert('体验模式：未拨打电话。');
+    window.alert('试用模式：不会拨打电话。');
   }
 
   return (
     <main className="elder-page">
       <a className="skip-link" href="#elder-main">跳到主要内容</a>
       <header className="mobile-header">
-        <Link href="/" aria-label="返回 TwinGuard 首页">TwinGuard</Link>
+        <a href="/" aria-label="返回 TwinGuard 首页">TwinGuard</a>
         <span>老人端</span>
       </header>
 
@@ -65,14 +65,14 @@ export default function ElderPage() {
             <button className="sos-button" type="button" onClick={startHelp}>
               <span aria-hidden="true">!</span>
               <strong>紧急求助</strong>
-              <small>体验操作，不会通知家属</small>
+              <small>试用模式 · 不会通知家属</small>
             </button>
           ) : null}
 
           {state === 'countdown' ? (
             <div className="countdown-card" role="status" aria-live="assertive">
               <strong>{seconds}</strong>
-              <p>秒后完成求助演示</p>
+              <p>秒后自动发出求助</p>
               <button type="button" onClick={cancelHelp}>取消，我按错了</button>
             </div>
           ) : null}
@@ -80,7 +80,7 @@ export default function ElderPage() {
           {state === 'sent' ? (
             <div className="sent-card" role="status" aria-live="assertive">
               <span aria-hidden="true">✓</span>
-              <h2>已模拟发出求助</h2>
+              <h2>求助已发出</h2>
               <p>请在安全的地方坐好，等待家属联系。</p>
               <button type="button" onClick={reportSafe}>我现在没事</button>
             </div>

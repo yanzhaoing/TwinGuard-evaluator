@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 type PosePoint = [number, number, number];
 type ReplayFrame = {
@@ -66,11 +66,12 @@ type ReplayPayload = {
 };
 
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
-const skeleton: [number, number][] = [
+const SKELETON: [number, number][] = [
   [0, 1], [0, 2], [1, 3], [2, 4], [5, 6], [5, 7], [7, 9],
   [6, 8], [8, 10], [5, 11], [6, 12], [11, 12], [11, 13],
   [13, 15], [12, 14], [14, 16],
 ];
+const JOINT_CONF = 0.28;
 
 const actionLabels: Record<string, string> = {
   continue_monitoring: '持续监测',
@@ -80,14 +81,27 @@ const actionLabels: Record<string, string> = {
   emergency_response: '进入应急响应',
 };
 
-const guardLabels: Record<string, string> = {
-  normal_guard: '稳定监测',
-  state_fluctuation: '检测到状态波动',
-  multimodal_review: '证据复核中',
-  confirmed_high_risk: '已确认高风险',
-  warning_guard: '风险提示',
-  suspected_guard: '疑似事件',
-  confirmed_guard: '完整确认',
+const notifyByAction: Record<string, string> = {
+  continue_monitoring: '不通知家属 · 持续监测',
+  extend_observation: '暂不通知 · 延长观察',
+  track_and_record: '记录事件证据 · 准备通知',
+  start_emergency_response: '已通知家属通知端 · 启动应急处置',
+  emergency_response: '已通知家属通知端 · 应急响应中',
+};
+
+type StageKey = 'normal' | 'warning' | 'suspected' | 'confirmed';
+const stageLabels: Record<StageKey, string> = {
+  normal: '正常监测',
+  warning: '风险升高',
+  suspected: '疑似事件',
+  confirmed: '确认告警',
+};
+const stageTones: Record<StageKey | 'recovered', string> = {
+  normal: 'ok',
+  warning: 'warn',
+  suspected: 'alert',
+  confirmed: 'danger',
+  recovered: 'ok',
 };
 
 const clamp = (value: number, min = 0, max = 100) => Math.min(max, Math.max(min, value));
@@ -110,7 +124,7 @@ function nearestFrame(frames: ReplayFrame[], time: number) {
   return frames[low];
 }
 
-function interpolatedPoseFrame(frames: ReplayFrame[], time: number) {
+function poseAt(frames: ReplayFrame[], time: number) {
   const fallback = nearestFrame(frames, time);
   if (!fallback || frames.length < 2) return fallback;
 
@@ -154,6 +168,12 @@ function previewStart(replayCase: ReplayCase) {
 
 export default function ReplayConsole() {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const activeCaseRef = useRef<ReplayCase | null>(null);
+  const timeRef = useRef(0);
+  const lastPushRef = useRef(-1);
+  const speedRef = useRef(1);
   const [payload, setPayload] = useState<ReplayPayload | null>(null);
   const [activeId, setActiveId] = useState('forward-fall');
   const [currentTime, setCurrentTime] = useState(0);
@@ -179,77 +199,277 @@ export default function ReplayConsole() {
     () => activeCase ? nearestFrame(activeCase.frames, currentTime) : null,
     [activeCase, currentTime],
   );
-  const poseFrame = useMemo(
-    () => activeCase ? interpolatedPoseFrame(activeCase.frames, currentTime) : null,
-    [activeCase, currentTime],
-  );
 
-  useEffect(() => {
-    if (!playing) return;
-    const video = videoRef.current;
-    if (!video) return;
-
-    if (typeof video.requestVideoFrameCallback === 'function') {
-      let callbackId = 0;
-      const update: VideoFrameRequestCallback = (_now, metadata) => {
-        setCurrentTime(metadata.mediaTime);
-        if (!video.paused && !video.ended) callbackId = video.requestVideoFrameCallback(update);
-      };
-      callbackId = video.requestVideoFrameCallback(update);
-      return () => video.cancelVideoFrameCallback(callbackId);
+  const caseStats = useMemo(() => {
+    if (!activeCase) return null;
+    let lastFlaggedAt: number | null = null;
+    const maxFactor = { rapidScore: 0, descent: 0, descentSpeed: 0, rotation: 0 };
+    for (const item of activeCase.frames) {
+      if (item.warning || item.warningLatched || item.suspected || item.complete || item.emergency) {
+        lastFlaggedAt = item.t;
+      }
+      if (item.rapidScore !== null) maxFactor.rapidScore = Math.max(maxFactor.rapidScore, item.rapidScore);
+      if (item.descent !== null) maxFactor.descent = Math.max(maxFactor.descent, item.descent);
+      if (item.descentSpeed !== null) maxFactor.descentSpeed = Math.max(maxFactor.descentSpeed, item.descentSpeed);
+      if (item.rotation !== null) maxFactor.rotation = Math.max(maxFactor.rotation, item.rotation);
     }
-
-    let raf = 0;
-    const update = () => {
-      setCurrentTime(video.currentTime);
-      raf = requestAnimationFrame(update);
-    };
-    raf = requestAnimationFrame(update);
-    return () => cancelAnimationFrame(raf);
-  }, [playing]);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !activeCase) return;
-    video.pause();
-    video.load();
-    const start = previewStart(activeCase);
-    video.currentTime = start;
-    setCurrentTime(start);
-    setPlaying(false);
+    return { lastFlaggedAt, maxFactor };
   }, [activeCase]);
 
+  const timelinePoints = useMemo(() => {
+    if (!activeCase) return '';
+    return activeCase.frames.map((item) => {
+      const x = (item.t / activeCase.duration) * 1000;
+      const y = 126 - clamp(item.riskScore ?? 0) * 1.02;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+  }, [activeCase]);
+
+  const draw = useCallback((mediaTime: number) => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const stage = stageRef.current;
+    const replayCase = activeCaseRef.current;
+    if (!video || !canvas || !stage || !replayCase) return;
+
+    const stageRect = stage.getBoundingClientRect();
+    const videoRect = video.getBoundingClientRect();
+    const sourceWidth = video.videoWidth || replayCase.width;
+    const sourceHeight = video.videoHeight || replayCase.height;
+    if (!sourceWidth || !sourceHeight || videoRect.width === 0 || videoRect.height === 0) return;
+
+    // Exact object-fit: contain geometry — the content box the video frames occupy.
+    const scale = Math.min(videoRect.width / sourceWidth, videoRect.height / sourceHeight);
+    const contentWidth = sourceWidth * scale;
+    const contentHeight = sourceHeight * scale;
+    const contentLeft = videoRect.left - stageRect.left + (videoRect.width - contentWidth) / 2;
+    const contentTop = videoRect.top - stageRect.top + (videoRect.height - contentHeight) / 2;
+
+    const dpr = window.devicePixelRatio || 1;
+    const pixelWidth = Math.max(1, Math.round(contentWidth * dpr));
+    const pixelHeight = Math.max(1, Math.round(contentHeight * dpr));
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+    }
+    canvas.style.left = `${contentLeft}px`;
+    canvas.style.top = `${contentTop}px`;
+    canvas.style.width = `${contentWidth}px`;
+    canvas.style.height = `${contentHeight}px`;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, contentWidth, contentHeight);
+
+    const poseFrame = poseAt(replayCase.frames, mediaTime);
+    if (!poseFrame || !poseFrame.person || !poseFrame.pose.length || video.readyState < 2) return;
+
+    const metricFrame = nearestFrame(replayCase.frames, mediaTime);
+    const tone = metricFrame && (metricFrame.complete || metricFrame.emergency) ? 'danger'
+      : metricFrame && metricFrame.suspected ? 'alert'
+        : metricFrame && (metricFrame.warning || metricFrame.warningLatched) ? 'warn'
+          : 'ok';
+    const toneColor = { ok: '#7df1bd', warn: '#ffd27d', alert: '#ffab7a', danger: '#ff8d85' }[tone];
+    const toneGlow = {
+      ok: 'rgba(103, 230, 170, .85)', warn: 'rgba(255, 210, 125, .85)',
+      alert: 'rgba(255, 171, 122, .85)', danger: 'rgba(255, 141, 133, .9)',
+    }[tone];
+
+    const px = (point: PosePoint) => point[0] * contentWidth;
+    const py = (point: PosePoint) => point[1] * contentHeight;
+
+    if (poseFrame.bbox) {
+      const [x1, y1, x2, y2] = poseFrame.bbox;
+      ctx.save();
+      ctx.strokeStyle = toneColor;
+      ctx.globalAlpha = 0.75;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([9, 6]);
+      ctx.strokeRect(
+        (x1 / sourceWidth) * contentWidth,
+        (y1 / sourceHeight) * contentHeight,
+        ((x2 - x1) / sourceWidth) * contentWidth,
+        ((y2 - y1) / sourceHeight) * contentHeight,
+      );
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.strokeStyle = toneColor;
+    ctx.lineWidth = Math.max(2.5, contentWidth * 0.0032);
+    ctx.lineCap = 'round';
+    ctx.shadowColor = toneGlow;
+    ctx.shadowBlur = 7;
+    for (const [from, to] of SKELETON) {
+      const a = poseFrame.pose[from];
+      const b = poseFrame.pose[to];
+      if (!a || !b || a[2] < JOINT_CONF || b[2] < JOINT_CONF) continue;
+      ctx.beginPath();
+      ctx.moveTo(px(a), py(a));
+      ctx.lineTo(px(b), py(b));
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    const jointRadius = Math.max(3.5, contentWidth * 0.0058);
+    ctx.save();
+    ctx.fillStyle = '#f6fffa';
+    ctx.strokeStyle = toneColor;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = toneGlow;
+    ctx.shadowBlur = 6;
+    for (const point of poseFrame.pose) {
+      if (point[2] < JOINT_CONF) continue;
+      ctx.beginPath();
+      ctx.arc(px(point), py(point), jointRadius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    ctx.restore();
+  }, []);
+
+  const clearCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (canvas && ctx) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }, []);
+
+  const pushTime = useCallback((time: number, force = false) => {
+    timeRef.current = time;
+    draw(time);
+    if (force || Math.abs(time - lastPushRef.current) >= 0.05) {
+      lastPushRef.current = time;
+      setCurrentTime(time);
+    }
+  }, [draw]);
+
   useEffect(() => {
-    if (videoRef.current) videoRef.current.playbackRate = speed;
-  }, [speed]);
+    const video = videoRef.current;
+    const stage = stageRef.current;
+    const replayCase = activeCase;
+    if (!video || !stage || !replayCase) return;
+
+    activeCaseRef.current = replayCase;
+    const start = previewStart(replayCase);
+    timeRef.current = start;
+    lastPushRef.current = start;
+    setCurrentTime(start);
+    setPlaying(false);
+    clearCanvas();
+    video.pause();
+    video.playbackRate = speedRef.current;
+
+    const seekToStart = () => { video.currentTime = start; };
+    if (video.readyState >= 1) seekToStart();
+    else video.addEventListener('loadedmetadata', seekToStart, { once: true });
+
+    const onSeeked = () => pushTime(video.currentTime, true);
+    const onPlay = () => setPlaying(true);
+    const onPause = () => setPlaying(false);
+    const onEnded = () => { setPlaying(false); pushTime(video.currentTime, true); };
+    const onLoadedData = () => draw(timeRef.current);
+    video.addEventListener('seeked', onSeeked);
+    video.addEventListener('play', onPlay);
+    video.addEventListener('pause', onPause);
+    video.addEventListener('ended', onEnded);
+    video.addEventListener('loadeddata', onLoadedData);
+
+    let stopped = false;
+    let videoFrameId = 0;
+    let rafId = 0;
+    const useFrameCallback = typeof video.requestVideoFrameCallback === 'function';
+    if (useFrameCallback) {
+      const onVideoFrame: VideoFrameRequestCallback = (_now, metadata) => {
+        if (stopped) return;
+        pushTime(metadata.mediaTime);
+        videoFrameId = video.requestVideoFrameCallback(onVideoFrame);
+      };
+      videoFrameId = video.requestVideoFrameCallback(onVideoFrame);
+    } else {
+      const loop = () => {
+        if (stopped) return;
+        pushTime(video.currentTime);
+        rafId = requestAnimationFrame(loop);
+      };
+      rafId = requestAnimationFrame(loop);
+    }
+
+    const redraw = () => draw(timeRef.current);
+    const observer = new ResizeObserver(redraw);
+    observer.observe(stage);
+    observer.observe(video);
+    window.addEventListener('resize', redraw);
+
+    return () => {
+      stopped = true;
+      if (useFrameCallback) video.cancelVideoFrameCallback(videoFrameId);
+      else cancelAnimationFrame(rafId);
+      observer.disconnect();
+      window.removeEventListener('resize', redraw);
+      video.removeEventListener('seeked', onSeeked);
+      video.removeEventListener('play', onPlay);
+      video.removeEventListener('pause', onPause);
+      video.removeEventListener('ended', onEnded);
+      video.removeEventListener('loadeddata', onLoadedData);
+    };
+  }, [activeCase, draw, pushTime, clearCanvas]);
 
   if (error) return <div className="replay-error" role="alert">{error}</div>;
-  if (!payload || !activeCase || !frame || !poseFrame) return <div className="replay-loading"><i /><span>正在校验并载入回放结果</span></div>;
+  if (!payload || !activeCase || !frame || !caseStats) {
+    return <div className="replay-loading"><i /><span>正在载入守护数据</span></div>;
+  }
 
   const risk = frame.riskScore ?? 0;
-  const rapid = (frame.rapidScore ?? 0) * 100;
-  const timelinePoints = activeCase.frames.map((item) => {
-    const x = (item.t / activeCase.duration) * 1000;
-    const y = 126 - clamp(item.riskScore ?? 0) * 1.02;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(' ');
+  const stage: StageKey = frame.complete || frame.emergency ? 'confirmed'
+    : frame.suspected ? 'suspected'
+      : frame.warning || frame.warningLatched ? 'warning'
+        : 'normal';
+  const recovered = stage === 'normal'
+    && caseStats.lastFlaggedAt !== null
+    && currentTime > caseStats.lastFlaggedAt;
+  const stageLabel = recovered
+    ? (activeCase.firstComplete !== null ? '告警解除 · 恢复监测' : '风险解除 · 恢复监测')
+    : stageLabels[stage];
+  const stageTone = recovered ? stageTones.recovered : stageTones[stage];
+  const levelLabel = stage === 'confirmed' ? '高风险'
+    : stage === 'suspected' ? '较高风险'
+      : stage === 'warning' ? '中风险 · 关注'
+        : '低风险';
+
+  const factors = frame.riskAvailable ? ([
+    { key: 'rapidScore', label: 'RapidFall 评分', value: frame.rapidScore, max: caseStats.maxFactor.rapidScore, text: frame.rapidScore === null ? '—' : `${Math.round(frame.rapidScore * 100)}%` },
+    { key: 'descentSpeed', label: '下降速度', value: frame.descentSpeed, max: caseStats.maxFactor.descentSpeed, text: formatMetric(frame.descentSpeed) },
+    { key: 'descent', label: '累计下降量', value: frame.descent, max: caseStats.maxFactor.descent, text: formatMetric(frame.descent) },
+    { key: 'rotation', label: '姿态旋转', value: frame.rotation, max: caseStats.maxFactor.rotation, text: formatMetric(frame.rotation) },
+  ]
+    .filter((item) => item.value !== null && item.max > 0)
+    .sort((a, b) => (b.value! / b.max) - (a.value! / a.max))
+    .slice(0, 3)) : [];
+
   const eventTime = activeCase.firstWarning ?? activeCase.instabilityStart ?? 0;
   const gateSteps = [
-    { label: '持续监测', detail: '基线状态', time: 0, active: !frame.warning && !frame.suspected && !frame.complete },
-    { label: '风险提示', detail: '延长观察', time: activeCase.firstWarning, active: frame.warning || frame.warningLatched },
-    { label: '疑似事件', detail: '跟踪记录', time: activeCase.firstSuspected, active: frame.suspected },
-    { label: '完整确认', detail: '应急响应', time: activeCase.firstComplete, active: frame.complete || frame.emergency },
+    { label: '持续监测', detail: '基线状态', time: 0, active: stage === 'normal' },
+    { label: '风险提示', detail: '延长观察', time: activeCase.firstWarning, active: stage === 'warning' },
+    { label: '疑似事件', detail: '跟踪记录', time: activeCase.firstSuspected, active: stage === 'suspected' },
+    { label: '完整确认', detail: '应急响应', time: activeCase.firstComplete, active: stage === 'confirmed' },
   ];
 
   const seek = (time: number) => {
+    const video = videoRef.current;
+    if (!video) return;
     const next = clamp(time, 0, activeCase.duration);
-    if (videoRef.current) videoRef.current.currentTime = next;
-    setCurrentTime(next);
+    video.currentTime = next;
+    pushTime(next, true);
   };
   const togglePlayback = async () => {
     const video = videoRef.current;
     if (!video) return;
-    if (video.paused) {
+    if (video.paused || video.ended) {
+      if (video.ended) video.currentTime = 0;
       try {
         await video.play();
       } catch {
@@ -259,16 +479,28 @@ export default function ReplayConsole() {
       video.pause();
     }
   };
+  const replay = async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = 0;
+    pushTime(0, true);
+    try {
+      await video.play();
+    } catch {
+      setPlaying(false);
+    }
+  };
   const cycleSpeed = () => {
     const next = speed === 1 ? 0.5 : speed === 0.5 ? 1.5 : 1;
     setSpeed(next);
+    speedRef.current = next;
     if (videoRef.current) videoRef.current.playbackRate = next;
   };
 
   return (
     <section className="replay-console" aria-label="线上守护">
       <div className="replay-casebar">
-        <div className="case-tabs" role="tablist" aria-label="选择回放案例">
+        <div className="case-tabs" role="tablist" aria-label="选择守护案例">
           {payload.cases.map((item) => (
             <button
               key={item.id}
@@ -283,60 +515,22 @@ export default function ReplayConsole() {
             </button>
           ))}
         </div>
-        <div className="replay-integrity"><i /><span>冻结运行时</span><b>{payload.runtime.name.replace('TwinGuard ', '')}</b></div>
+        <div className="replay-integrity"><i /><span>离线推理结果 · 逐帧同步呈现</span></div>
       </div>
 
       <div className="replay-grid">
         <div className="replay-stage-column">
-          <div className="video-stage">
+          <div className="video-stage" ref={stageRef}>
             <video
+              key={activeCase.id}
               ref={videoRef}
               muted
               playsInline
-              preload="metadata"
+              preload="auto"
               src={`${basePath}${activeCase.video}`}
-              onPlay={() => setPlaying(true)}
-              onPause={() => setPlaying(false)}
-              onEnded={() => setPlaying(false)}
-              onLoadedData={(event) => {
-                const video = event.currentTarget;
-                if (typeof video.requestVideoFrameCallback === 'function') {
-                  video.requestVideoFrameCallback((_now, metadata) => setCurrentTime(metadata.mediaTime));
-                } else setCurrentTime(video.currentTime);
-              }}
-              onSeeked={(event) => {
-                const video = event.currentTarget;
-                if (typeof video.requestVideoFrameCallback === 'function') {
-                  video.requestVideoFrameCallback((_now, metadata) => setCurrentTime(metadata.mediaTime));
-                } else setCurrentTime(video.currentTime);
-              }}
-              onTimeUpdate={(event) => {
-                if (typeof event.currentTarget.requestVideoFrameCallback !== 'function') {
-                  setCurrentTime(event.currentTarget.currentTime);
-                }
-              }}
               aria-label={`${activeCase.title}原始视频`}
             />
-            <svg className="pose-layer" viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true">
-              {poseFrame.bbox && (
-                <rect
-                  x={poseFrame.bbox[0] / activeCase.width}
-                  y={poseFrame.bbox[1] / activeCase.height}
-                  width={(poseFrame.bbox[2] - poseFrame.bbox[0]) / activeCase.width}
-                  height={(poseFrame.bbox[3] - poseFrame.bbox[1]) / activeCase.height}
-                  className="pose-box"
-                />
-              )}
-              {skeleton.map(([from, to]) => {
-                const a = poseFrame.pose[from];
-                const b = poseFrame.pose[to];
-                if (!a || !b || a[2] < .28 || b[2] < .28) return null;
-                return <line key={`${from}-${to}`} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} className="pose-bone" />;
-              })}
-              {poseFrame.pose.map((point, index) => point[2] >= .28
-                ? <circle key={index} cx={point[0]} cy={point[1]} r="0.006" className="pose-joint" />
-                : null)}
-            </svg>
+            <canvas ref={canvasRef} className="pose-layer" aria-hidden="true" />
             <div className="video-topline">
               <span className="analysis-state"><i className={frame.person ? 'seen' : ''} />{frame.person ? '人体姿态已跟踪' : '等待可靠姿态'}</span>
               <code>{formatTime(currentTime)}</code>
@@ -355,13 +549,14 @@ export default function ReplayConsole() {
               type="range"
               min="0"
               max={activeCase.duration}
-              step="0.01"
+              step="0.05"
               value={currentTime}
               onChange={(event) => seek(Number(event.target.value))}
               aria-label="回放时间轴"
             />
-            <button className="speed-control" type="button" onClick={cycleSpeed}>{speed.toFixed(1)}×</button>
+            <button className="speed-control" type="button" onClick={cycleSpeed} aria-label="切换倍速">{speed.toFixed(1)}×</button>
             <button className="event-control" type="button" onClick={() => seek(Math.max(0, eventTime - 1.4))}>跳到关键段</button>
+            <button className="event-control" type="button" onClick={replay}>重新播放</button>
           </div>
 
           <div className="risk-timeline">
@@ -384,16 +579,33 @@ export default function ReplayConsole() {
           </div>
         </div>
 
-        <aside className="telemetry-panel" aria-label="当前时点推理参数">
+        <aside className="telemetry-panel" aria-label="当前时点守护参数">
           <div className="risk-overview">
-            <div className="risk-ring" style={{'--risk': `${risk * 3.6}deg`} as React.CSSProperties}>
+            <div className={`risk-ring tone-${stageTone}`} style={{ '--risk': `${risk * 3.6}deg` } as React.CSSProperties}>
               <span><b>{frame.riskAvailable ? Math.round(risk) : '—'}</b><small>/ 100</small></span>
             </div>
-            <div>
-              <p>当前风险分</p>
-              <h2>{guardLabels[frame.guardState] ?? '状态待解析'}</h2>
-              <span>{actionLabels[frame.action] ?? '处置状态待解析'}</span>
+            <div className="risk-overview-text">
+              <p>当前风险分 · {levelLabel}</p>
+              <h2><span className={`stage-chip tone-${stageTone}`} />{stageLabel}</h2>
+              <span className="notify-line">{notifyByAction[frame.action] ?? actionLabels[frame.action] ?? '处置状态待解析'}</span>
             </div>
+          </div>
+
+          <div className="factor-panel">
+            <p className="panel-kicker">主要贡献因子</p>
+            {factors.length ? (
+              <ul>
+                {factors.map((item) => (
+                  <li key={item.key}>
+                    <span className="factor-label">{item.label}</span>
+                    <span className="factor-bar"><i style={{ width: `${clamp((item.value! / item.max) * 100)}%` }} /></span>
+                    <b>{item.text}</b>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="factor-empty">当前帧未输出风险因子，等待可靠人体姿态。</p>
+            )}
           </div>
 
           <div className="gate-panel">
@@ -416,11 +628,11 @@ export default function ReplayConsole() {
             <p className="panel-kicker">当前帧参数</p>
             <dl>
               <div><dt>姿态质量</dt><dd>{frame.poseQuality === null ? '—' : `${Math.round(frame.poseQuality * 100)}%`}</dd></div>
-              <div><dt>RapidFall</dt><dd>{frame.rapidScore === null ? '—' : `${Math.round(rapid)}%`}</dd></div>
+              <div><dt>RapidFall</dt><dd>{frame.rapidScore === null ? '—' : `${Math.round(frame.rapidScore * 100)}%`}</dd></div>
               <div><dt>下降量</dt><dd>{formatMetric(frame.descent)}</dd></div>
               <div><dt>下降速度</dt><dd>{formatMetric(frame.descentSpeed)}</dd></div>
               <div><dt>姿态旋转</dt><dd>{formatMetric(frame.rotation)}</dd></div>
-              <div><dt>轨迹连续</dt><dd>{frame.continuity === null ? '—' : `${Math.round(frame.continuity * 100)}%`}</dd></div>
+              <div><dt>轨迹连续</dt><dd>{frame.continuity === null ? '—' : `${Math.round(clamp(frame.continuity, 0, 1) * 100)}%`}</dd></div>
             </dl>
           </div>
 
@@ -429,7 +641,7 @@ export default function ReplayConsole() {
             {activeCase.kind === 'fall' ? (
               <>
                 <h3>完整确认早于触地 {(activeCase.groundContact! - activeCase.firstComplete!).toFixed(3)} 秒</h3>
-                <span>风险提示早于触地 {(activeCase.groundContact! - activeCase.firstWarning!).toFixed(3)} 秒；本案例进入应急响应。</span>
+                <span>风险提示早于触地 {(activeCase.groundContact! - activeCase.firstWarning!).toFixed(3)} 秒；本案例进入应急响应并通知家属通知端。</span>
               </>
             ) : (
               <>
@@ -442,8 +654,8 @@ export default function ReplayConsole() {
       </div>
 
       <footer className="console-footer">
-        <span>样本文件 <code>{activeCase.sourceSha256.slice(0, 12)}…</code></span>
-        <span>结果只对应当前公开案例，不外推为长期误报率。</span>
+        <span>视频与逐帧数据来自本地离线推理结果，打开页面即可体验完整守护流程。</span>
+        <span>TwinGuard 线上守护</span>
       </footer>
     </section>
   );
