@@ -89,20 +89,45 @@ const notifyByAction: Record<string, string> = {
   emergency_response: '已通知家属通知端 · 应急响应中',
 };
 
-type StageKey = 'normal' | 'warning' | 'suspected' | 'confirmed';
+type StageKey = 'normal' | 'warning' | 'review' | 'suspected' | 'confirmed';
 const stageLabels: Record<StageKey, string> = {
   normal: '正常监测',
-  warning: '风险升高',
+  warning: '风险提示',
+  review: '复核观察中',
   suspected: '疑似事件',
   confirmed: '确认告警',
 };
-const stageTones: Record<StageKey | 'recovered', string> = {
+type ToneKey = 'ok' | 'warn' | 'alert' | 'danger';
+const stageTones: Record<StageKey | 'recovered', ToneKey> = {
   normal: 'ok',
   warning: 'warn',
+  review: 'warn',
   suspected: 'alert',
   confirmed: 'danger',
   recovered: 'ok',
 };
+
+// A frame counts as "incident" when either the gate flags or the runtime guard
+// state machine say the person is not at baseline. Severity splits the ladder:
+// severe = suspected or worse (drives 告警解除), watch = warning-level (风险解除).
+const isIncidentFrame = (frame: ReplayFrame) => (
+  frame.warning || frame.warningLatched || frame.suspected || frame.complete || frame.emergency
+  || frame.guardState !== 'normal_guard'
+);
+const isSevereFrame = (frame: ReplayFrame) => (
+  frame.suspected || frame.complete || frame.emergency || frame.guardState === 'confirmed_high_risk'
+);
+const isWarnFrame = (frame: ReplayFrame) => (
+  frame.warning || frame.warningLatched || frame.guardState === 'state_fluctuation'
+);
+
+function stageOfFrame(frame: ReplayFrame): StageKey {
+  if (frame.complete || frame.emergency || frame.guardState === 'confirmed_high_risk') return 'confirmed';
+  if (frame.suspected) return 'suspected';
+  if (frame.guardState === 'multimodal_review') return 'review';
+  if (frame.warning || frame.warningLatched || frame.guardState === 'state_fluctuation') return 'warning';
+  return 'normal';
+}
 
 const clamp = (value: number, min = 0, max = 100) => Math.min(max, Math.max(min, value));
 const formatTime = (seconds: number) => {
@@ -202,18 +227,26 @@ export default function ReplayConsole() {
 
   const caseStats = useMemo(() => {
     if (!activeCase) return null;
-    let lastFlaggedAt: number | null = null;
+    // Episode boundaries from the data itself: an episode runs while frames are
+    // non-baseline (gate flags or guard state machine); it ends at the first
+    // baseline frame. Severe (suspected+) and warning-level episodes are tracked
+    // separately so the recovery label matches what actually happened.
+    let severeEndAt: number | null = null;
+    let warnEndAt: number | null = null;
+    let severeOpen = false;
+    let warnOpen = false;
     const maxFactor = { rapidScore: 0, descent: 0, descentSpeed: 0, rotation: 0 };
     for (const item of activeCase.frames) {
-      if (item.warning || item.warningLatched || item.suspected || item.complete || item.emergency) {
-        lastFlaggedAt = item.t;
-      }
+      if (isSevereFrame(item)) { severeOpen = true; severeEndAt = null; }
+      else if (severeOpen && !isIncidentFrame(item)) { severeEndAt = item.t; severeOpen = false; }
+      if (isWarnFrame(item)) { warnOpen = true; warnEndAt = null; }
+      else if (warnOpen && !isIncidentFrame(item)) { warnEndAt = item.t; warnOpen = false; }
       if (item.rapidScore !== null) maxFactor.rapidScore = Math.max(maxFactor.rapidScore, item.rapidScore);
       if (item.descent !== null) maxFactor.descent = Math.max(maxFactor.descent, item.descent);
       if (item.descentSpeed !== null) maxFactor.descentSpeed = Math.max(maxFactor.descentSpeed, item.descentSpeed);
       if (item.rotation !== null) maxFactor.rotation = Math.max(maxFactor.rotation, item.rotation);
     }
-    return { lastFlaggedAt, maxFactor };
+    return { severeEndAt, warnEndAt, maxFactor };
   }, [activeCase]);
 
   const timelinePoints = useMemo(() => {
@@ -266,10 +299,7 @@ export default function ReplayConsole() {
     if (!poseFrame || !poseFrame.person || !poseFrame.pose.length || video.readyState < 2) return;
 
     const metricFrame = nearestFrame(replayCase.frames, mediaTime);
-    const tone = metricFrame && (metricFrame.complete || metricFrame.emergency) ? 'danger'
-      : metricFrame && metricFrame.suspected ? 'alert'
-        : metricFrame && (metricFrame.warning || metricFrame.warningLatched) ? 'warn'
-          : 'ok';
+    const tone = metricFrame ? stageTones[stageOfFrame(metricFrame)] : 'ok';
     const toneColor = { ok: '#7df1bd', warn: '#ffd27d', alert: '#ffab7a', danger: '#ff8d85' }[tone];
     const toneGlow = {
       ok: 'rgba(103, 230, 170, .85)', warn: 'rgba(255, 210, 125, .85)',
@@ -424,21 +454,23 @@ export default function ReplayConsole() {
   }
 
   const risk = frame.riskScore ?? 0;
-  const stage: StageKey = frame.complete || frame.emergency ? 'confirmed'
-    : frame.suspected ? 'suspected'
-      : frame.warning || frame.warningLatched ? 'warning'
-        : 'normal';
-  const recovered = stage === 'normal'
-    && caseStats.lastFlaggedAt !== null
-    && currentTime > caseStats.lastFlaggedAt;
-  const stageLabel = recovered
-    ? (activeCase.firstComplete !== null ? '告警解除 · 恢复监测' : '风险解除 · 恢复监测')
-    : stageLabels[stage];
+  const stage: StageKey = stageOfFrame(frame);
+  const recoveredSevere = stage === 'normal'
+    && caseStats.severeEndAt !== null
+    && currentTime >= caseStats.severeEndAt;
+  const recoveredWarn = stage === 'normal' && !recoveredSevere
+    && caseStats.warnEndAt !== null
+    && currentTime >= caseStats.warnEndAt;
+  const recovered = recoveredSevere || recoveredWarn;
+  const stageLabel = recoveredSevere ? '告警解除 · 恢复监测'
+    : recoveredWarn ? '风险解除 · 恢复监测'
+      : stageLabels[stage];
   const stageTone = recovered ? stageTones.recovered : stageTones[stage];
   const levelLabel = stage === 'confirmed' ? '高风险'
     : stage === 'suspected' ? '较高风险'
-      : stage === 'warning' ? '中风险 · 关注'
-        : '低风险';
+      : stage === 'review' ? '中风险 · 持续观察'
+        : stage === 'warning' ? '中风险 · 关注'
+          : '低风险';
 
   const factors = frame.riskAvailable ? ([
     { key: 'rapidScore', label: 'RapidFall 评分', value: frame.rapidScore, max: caseStats.maxFactor.rapidScore, text: frame.rapidScore === null ? '—' : `${Math.round(frame.rapidScore * 100)}%` },
@@ -453,7 +485,7 @@ export default function ReplayConsole() {
   const eventTime = activeCase.firstWarning ?? activeCase.instabilityStart ?? 0;
   const gateSteps = [
     { label: '持续监测', detail: '基线状态', time: 0, active: stage === 'normal' },
-    { label: '风险提示', detail: '延长观察', time: activeCase.firstWarning, active: stage === 'warning' },
+    { label: '风险提示', detail: '延长观察', time: activeCase.firstWarning, active: stage === 'warning' || stage === 'review' },
     { label: '疑似事件', detail: '跟踪记录', time: activeCase.firstSuspected, active: stage === 'suspected' },
     { label: '完整确认', detail: '应急响应', time: activeCase.firstComplete, active: stage === 'confirmed' },
   ];
